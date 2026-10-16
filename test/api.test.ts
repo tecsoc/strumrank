@@ -18,8 +18,16 @@ function call(path: string, init: RequestInit & { cookie?: string } = {}) {
   return exports.default.fetch(new Request(`${ORIGIN}${path}`, { ...init, headers }))
 }
 
+// 曲の登録も確認済みの投票者に限られ、1人1日20曲までなので、登録用の投票者を順に使い回す
+let registrar = 0
+const registrarCookie = () => voter(41 + (registrar++ % 10))
+
 async function register(title: string, artist: string, itunesTrackId = Math.floor(Math.random() * 1e9) + 1) {
-  const res = await call('/api/songs', { method: 'POST', body: JSON.stringify({ itunesTrackId, title, artist }) })
+  const res = await call('/api/songs', {
+    method: 'POST',
+    cookie: registrarCookie(),
+    body: JSON.stringify({ itunesTrackId, title, artist }),
+  })
   return { status: res.status, body: (await res.json()) as { id: number; created: boolean } }
 }
 
@@ -58,6 +66,7 @@ describe('曲の登録と名寄せ', () => {
   it('Apple 以外のドメインの URL は受け付けない', async () => {
     const res = await call('/api/songs', {
       method: 'POST',
+      cookie: registrarCookie(),
       body: JSON.stringify({ itunesTrackId: 1, title: 'x', artist: 'y', artworkUrl: 'https://evil.example/a.jpg' }),
     })
     expect(res.status).toBe(400)

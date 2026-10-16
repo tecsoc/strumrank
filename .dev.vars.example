@@ -5,3 +5,7 @@ TURNSTILE_SITE_KEY=1x00000000000000000000AA
 TURNSTILE_SECRET=1x0000000000000000000000000000000AA
 # 投票者 ID と IP の HMAC 用。本番は `wrangler secret put VOTER_SECRET` で長いランダム値を入れる
 VOTER_SECRET=local-dev-voter-secret-change-me
+# 鍵を入れ替えるときだけ、入れ替え前の VOTER_SECRET を入れる（空なら使わない）
+VOTER_SECRET_PREV=
+# siteverify 応答の hostname と照合する値。空ならローカルのテストキー向けに照合しない
+TURNSTILE_HOSTNAME=

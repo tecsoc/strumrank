@@ -2,6 +2,8 @@
 
 type RenderOptions = {
   sitekey: string
+  /** サーバーが siteverify の応答と照合する用途名 */
+  action?: string
   callback: (token: string) => void
   'error-callback'?: () => void
   'expired-callback'?: () => void
@@ -19,6 +21,9 @@ declare global {
     turnstile?: TurnstileApi
   }
 }
+
+/** サーバー（src/worker/voter.ts の TURNSTILE_ACTION）と同じ値にする */
+export const TURNSTILE_ACTION = 'vote'
 
 const SCRIPT_URL = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
 let loading: Promise<TurnstileApi> | null = null

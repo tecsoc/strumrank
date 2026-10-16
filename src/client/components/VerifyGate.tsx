@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { loadTurnstile } from '../lib/turnstile'
+import { loadTurnstile, TURNSTILE_ACTION } from '../lib/turnstile'
 
 /**
  * 投票・いいねの前に1回だけ出す確認ダイアログ。Turnstile のトークンを受け取ったら onToken を呼ぶ。
@@ -32,6 +32,7 @@ export function VerifyGate({
         if (cancelled || !widgetRef.current) return
         widgetId = ts.render(widgetRef.current, {
           sitekey: siteKey,
+          action: TURNSTILE_ACTION,
           language: 'ja',
           theme: 'auto',
           callback: (token) => onTokenRef.current(token),

@@ -3,6 +3,10 @@ import { createRouter, RouterProvider } from '@tanstack/react-router'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { routeTree } from './routeTree.gen'
+// フォントは自己ホストする（外部のフォント配信に利用者の IP や Referer を渡さない）
+import '@fontsource/dela-gothic-one/400.css'
+import '@fontsource/zen-kaku-gothic-new/400.css'
+import '@fontsource/zen-kaku-gothic-new/700.css'
 import './styles.css'
 
 const queryClient = new QueryClient({

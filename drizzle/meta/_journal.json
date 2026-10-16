@@ -57,6 +57,13 @@
       "when": 1792156578029,
       "tag": "0007_songs_spotify_url",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1792158122345,
+      "tag": "0008_security_hardening",
+      "breakpoints": true
     }
   ]
 }

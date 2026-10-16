@@ -76,7 +76,7 @@ describe('統合済みの曲の扱い', () => {
     const src = await register('夏色 2', artist)
     await mergeSong(db, src, target)
     const res = await vote(db, src, voter(1), 3)
-    expect(res && 'song' in res ? res.song.id : null).toBe(target)
+    expect(typeof res === 'object' && res !== null && 'song' in res ? res.song.id : null).toBe(target)
     expect((await getSongRow(target))?.voteCount).toBe(1)
     const srcRow = await getSongRow(src)
     expect(srcRow?.voteCount).toBe(0)

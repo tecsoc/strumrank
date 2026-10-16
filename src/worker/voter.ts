@@ -5,6 +5,8 @@
 //    IP を変える手口に備えて、IPv4 /24・IPv6 /48 の範囲（サブネット）でも別枠で数える
 // 4. データセンター・VPN の回線（ASN）からは、確認から10分を過ぎた投票の前に Turnstile をもう一度求める
 // IP そのものは保存しない。
+// 署名の鍵は VOTER_SECRET（現在）と VOTER_SECRET_PREV（入れ替え前、任意）の両方で検証し、
+// 鍵を入れ替えても既存の投票者 ID が一斉に無効にならないようにする。
 import { zValidator } from '@hono/zod-validator'
 import { and, count, eq, gt, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/d1'
@@ -15,7 +17,18 @@ import { z } from 'zod'
 import { DATACENTER_ASNS } from './asn-list'
 import { voters } from './db/schema-voters'
 
+/** http（ローカル開発）で使う cookie 名。https では __Host- 付きを使う */
 export const VOTER_COOKIE = 'sr_vid'
+/** Secure・Path=/・Domain なしが必須の接頭辞。サブドメインからの上書きを防ぐ */
+export const VOTER_COOKIE_HOST = '__Host-sr_vid'
+/** 署名の形式の版。値は `<uuid>.v1.<署名>`（旧形式 `<uuid>.<署名>` も現鍵で読める） */
+const SIGNATURE_VERSION = 'v1'
+/** Turnstile の action。クライアントの render 時と同じ値にする */
+export const TURNSTILE_ACTION = 'vote'
+/** 投票のない投票者 ID を消すまでの日数と、投票があっても消す日数（cookie の寿命と同じ） */
+const INACTIVE_VOTER_DAYS = 30
+const VOTER_RETENTION_DAYS = 400
+const CLEANUP_BATCH = 500
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 400
 const SITEVERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify'
 const SITEVERIFY_TIMEOUT_MS = 5000
@@ -35,6 +48,10 @@ export type VoterBindings = {
   DB: D1Database
   /** HMAC 用の秘密鍵（wrangler secret） */
   VOTER_SECRET: string
+  /** 入れ替え前の HMAC 鍵（任意）。設定中はこの鍵で署名された cookie も受け付け、現鍵で署名し直す */
+  VOTER_SECRET_PREV?: string
+  /** siteverify 応答の hostname と照合する値（任意）。未設定なら hostname・action を照合しない（ローカルのテストキー用） */
+  TURNSTILE_HOSTNAME?: string
   /** Turnstile のシークレットキー（wrangler secret） */
   TURNSTILE_SECRET: string
   /** Turnstile のサイトキー（公開値。wrangler の vars） */
@@ -77,19 +94,49 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0
 }
 
-export async function signVoterId(secret: string, id: string): Promise<string> {
-  return `${id}.${base64url(await hmac(secret, `voter:${id}`))}`
+async function signature(secret: string, id: string): Promise<string> {
+  return base64url(await hmac(secret, `voter:${id}`))
 }
 
-/** 署名が正しければ投票者 ID を返す。未署名（旧形式の UUID だけ）や改ざんは null。 */
-export async function verifyVoterCookie(secret: string, value: string | undefined): Promise<string | null> {
+export async function signVoterId(secret: string, id: string): Promise<string> {
+  return `${id}.${SIGNATURE_VERSION}.${await signature(secret, id)}`
+}
+
+export type VerifiedVoter = {
+  id: string /** 旧形式・旧鍵の署名なので、現鍵の v1 形式で発行し直すべき */
+  stale: boolean
+}
+
+/**
+ * 署名が正しければ投票者 ID を返す。未署名（UUID だけ）や改ざんは null。
+ * v1 形式は現鍵 → 旧鍵（prevSecret）の順に、旧形式 `<uuid>.<署名>` は現鍵だけで検証する。
+ */
+export async function readVoterCookie(
+  secret: string,
+  value: string | undefined,
+  prevSecret?: string,
+): Promise<VerifiedVoter | null> {
   if (!value) return null
-  const dot = value.indexOf('.')
-  if (dot < 0) return null
-  const id = value.slice(0, dot)
+  const parts = value.split('.')
+  const id = parts[0] ?? ''
   if (!UUID.test(id)) return null
-  const expected = await signVoterId(secret, id)
-  return timingSafeEqual(expected, value) ? id : null
+  if (parts.length === 3 && parts[1] === SIGNATURE_VERSION) {
+    const sig = parts[2] ?? ''
+    if (timingSafeEqual(await signature(secret, id), sig)) return { id, stale: false }
+    if (prevSecret && timingSafeEqual(await signature(prevSecret, id), sig)) return { id, stale: true }
+    return null
+  }
+  if (parts.length === 2 && timingSafeEqual(await signature(secret, id), parts[1] ?? '')) return { id, stale: true }
+  return null
+}
+
+/** 署名が正しければ投票者 ID を返す（readVoterCookie の ID だけを返す版） */
+export async function verifyVoterCookie(
+  secret: string,
+  value: string | undefined,
+  prevSecret?: string,
+): Promise<string | null> {
+  return (await readVoterCookie(secret, value, prevSecret))?.id ?? null
 }
 
 export async function hashIp(secret: string, ip: string): Promise<string> {
@@ -140,6 +187,17 @@ export function normalizeIp(raw: string): string {
   return g.map((n) => n.toString(16)).join(':')
 }
 
+/**
+ * 回数制限（Rate Limiting）のキー。IPv6 は利用者が /64 の中でアドレスを自由に変えられるため /64 にまとめる。
+ * IPv4（IPv4-mapped IPv6 を含む）はそのまま。
+ */
+export function rateLimitKey(raw: string): string {
+  const ip = normalizeIp(raw)
+  if (!ip.includes(':')) return ip
+  const groups = ip.split(':')
+  return groups.length === 8 ? `${groups.slice(0, 4).join(':')}::/64` : ip
+}
+
 /** サブネット（IPv4 /24、IPv6 /48）の表記。ローカル開発の 'local' はそのまま */
 export function subnetOf(raw: string): string {
   const ip = normalizeIp(raw)
@@ -168,11 +226,16 @@ export function isDatacenterRequest(c: Context): boolean {
 
 // ---- Turnstile ----
 
+/**
+ * Turnstile のトークンを検証する。expectedHostname を渡したときは、応答の hostname と action も照合する
+ * （他サイトで解かれたトークンや、別の用途のウィジェットのトークンを使い回させない）。
+ */
 export async function verifyTurnstile(
   secret: string,
   token: string,
   ip: string,
   fetchImpl: typeof fetch = (...args) => fetch(...args),
+  expectedHostname?: string,
 ): Promise<boolean> {
   const body = new FormData()
   body.set('secret', secret)
@@ -185,8 +248,10 @@ export async function verifyTurnstile(
       signal: AbortSignal.timeout(SITEVERIFY_TIMEOUT_MS),
     })
     if (!res.ok) return false
-    const data = (await res.json()) as { success?: boolean }
-    return data.success === true
+    const data = (await res.json()) as { success?: boolean; hostname?: string; action?: string }
+    if (data.success !== true) return false
+    if (!expectedHostname) return true
+    return data.hostname === expectedHostname && data.action === TURNSTILE_ACTION
   } catch {
     return false
   }
@@ -226,6 +291,25 @@ export async function touchVerified(d1: D1Database, id: string, now = Date.now()
   return rows.length > 0
 }
 
+/**
+ * 古い投票者 ID を消す（Cron から呼ぶ）。発行から VOTER_RETENTION_DAYS を過ぎたもの、
+ * または INACTIVE_VOTER_DAYS を過ぎても票もいいねも無いものが対象。1回に CLEANUP_BATCH 行まで。
+ * 消した ID の票・いいねは残る（ランキングの集計は変わらない）。返り値は消した行数。
+ */
+export async function cleanupVoters(d1: D1Database, now = Date.now()): Promise<number> {
+  const expired = now - VOTER_RETENTION_DAYS * DAY_MS
+  const inactive = now - INACTIVE_VOTER_DAYS * DAY_MS
+  const res = await drizzle(d1).run(sql`
+    DELETE FROM voters WHERE id IN (
+      SELECT v.id FROM voters AS v
+      WHERE v.created_at < ${expired}
+        OR (v.created_at < ${inactive}
+          AND NOT EXISTS (SELECT 1 FROM votes WHERE voter_id = v.id)
+          AND NOT EXISTS (SELECT 1 FROM likes WHERE voter_id = v.id))
+      LIMIT ${CLEANUP_BATCH})`)
+  return res.meta.changes ?? 0
+}
+
 // ---- 1曲あたりの上限 ----
 
 /**
@@ -256,6 +340,33 @@ export async function checkPerSongIpCap(
   return row.mine === 1 || (row.n < cap && row.ns < subnetCap)
 }
 
+// ---- cookie ----
+
+const isHttps = (c: Context) => new URL(c.req.url).protocol === 'https:'
+
+/** __Host- 付き → 従来名の順に読み、署名を検証する */
+async function readVoter(c: Context, env: VoterBindings): Promise<VerifiedVoter | null> {
+  const host = getCookie(c, VOTER_COOKIE_HOST)
+  const legacy = getCookie(c, VOTER_COOKIE)
+  const fromHost = host ? await readVoterCookie(env.VOTER_SECRET, host, env.VOTER_SECRET_PREV) : null
+  if (fromHost) return fromHost
+  const fromLegacy = legacy ? await readVoterCookie(env.VOTER_SECRET, legacy, env.VOTER_SECRET_PREV) : null
+  // https で従来名の cookie しか無ければ、__Host- 付きへ移すため発行し直す
+  return fromLegacy && isHttps(c) ? { ...fromLegacy, stale: true } : fromLegacy
+}
+
+/** 現鍵の v1 形式で cookie を書く。https では __Host- 付きにし、従来名の cookie は消す */
+async function writeVoter(c: Context, env: VoterBindings, id: string) {
+  const value = await signVoterId(env.VOTER_SECRET, id)
+  const base = { httpOnly: true, sameSite: 'Lax', path: '/', maxAge: COOKIE_MAX_AGE } as const
+  if (isHttps(c)) {
+    setCookie(c, VOTER_COOKIE_HOST, value, { ...base, secure: true })
+    if (getCookie(c, VOTER_COOKIE)) setCookie(c, VOTER_COOKIE, '', { ...base, secure: true, maxAge: 0 })
+  } else {
+    setCookie(c, VOTER_COOKIE, value, base)
+  }
+}
+
 // ---- ミドルウェアとルート ----
 
 /**
@@ -263,8 +374,9 @@ export async function checkPerSongIpCap(
  * データセンター・VPN 経由では、確認から DATACENTER_REVERIFY_MS を過ぎていても 401 にして確認を通し直させる。
  */
 export const requireVoter = createMiddleware<VoterEnv>(async (c, next) => {
-  const id = await verifyVoterCookie(c.env.VOTER_SECRET, getCookie(c, VOTER_COOKIE))
-  if (!id) return c.json({ error: 'verification_required' }, 401)
+  const voter = await readVoter(c, c.env)
+  if (!voter) return c.json({ error: 'verification_required' }, 401)
+  const { id } = voter
   if (isDatacenterRequest(c)) {
     const row = await drizzle(c.env.DB)
       .select({ at: voters.lastVerifiedAt })
@@ -275,12 +387,15 @@ export const requireVoter = createMiddleware<VoterEnv>(async (c, next) => {
     if (Date.now() - at > DATACENTER_REVERIFY_MS) return c.json({ error: 'verification_required' }, 401)
   }
   c.set('voterId', id)
+  if (voter.stale) await writeVoter(c, c.env, id)
   await next()
 })
 
-/** 閲覧用。署名が正しければ投票者 ID、無ければ null。cookie は発行しない。 */
+/** 閲覧用。署名が正しければ投票者 ID、無ければ null。新しい ID は発行しない（旧形式の署名だけ書き直す）。 */
 export const optionalVoter = createMiddleware<OptionalVoterEnv>(async (c, next) => {
-  c.set('voterId', await verifyVoterCookie(c.env.VOTER_SECRET, getCookie(c, VOTER_COOKIE)))
+  const voter = await readVoter(c, c.env)
+  c.set('voterId', voter?.id ?? null)
+  if (voter?.stale) await writeVoter(c, c.env, voter.id)
   await next()
 })
 
@@ -298,7 +413,7 @@ export function registerSessionRoutes<E extends HonoEnv & { Bindings: VoterBindi
 ) {
   app.get('/session', async (c) => {
     const env = c.env as VoterBindings
-    const verified = (await verifyVoterCookie(env.VOTER_SECRET, getCookie(c, VOTER_COOKIE))) !== null
+    const verified = (await readVoter(c, env)) !== null
     c.header('Cache-Control', 'no-store')
     return c.json({ siteKey: env.TURNSTILE_SITE_KEY, verified })
   })
@@ -306,23 +421,26 @@ export function registerSessionRoutes<E extends HonoEnv & { Bindings: VoterBindi
   app.post('/session', zValidator('json', z.object({ token: z.string().min(1).max(2048) })), async (c) => {
     const env = c.env as VoterBindings
     const ip = clientIp(c)
-    const ok = await verifyTurnstile(env.TURNSTILE_SECRET, c.req.valid('json').token, ip, deps.fetch)
+    const ok = await verifyTurnstile(
+      env.TURNSTILE_SECRET,
+      c.req.valid('json').token,
+      ip,
+      deps.fetch,
+      env.TURNSTILE_HOSTNAME || undefined,
+    )
     if (!ok) return c.json({ error: 'verification_failed' }, 403)
 
     // 確認を通り直しただけなら新しい ID は作らず（発行の上限にも数えない）、確認時刻だけ更新する
-    const existing = await verifyVoterCookie(env.VOTER_SECRET, getCookie(c, VOTER_COOKIE))
-    if (existing && (await touchVerified(env.DB, existing))) return c.json({ ok: true })
+    const existing = await readVoter(c, env)
+    if (existing && (await touchVerified(env.DB, existing.id))) {
+      if (existing.stale) await writeVoter(c, env, existing.id)
+      return c.json({ ok: true })
+    }
 
     const id = await issueVoter(env.DB, env.VOTER_SECRET, ip)
     if (!id) return c.json({ error: 'too_many_voters' }, 429)
 
-    setCookie(c, VOTER_COOKIE, await signVoterId(env.VOTER_SECRET, id), {
-      httpOnly: true,
-      secure: new URL(c.req.url).protocol === 'https:',
-      sameSite: 'Lax',
-      path: '/',
-      maxAge: COOKIE_MAX_AGE,
-    })
+    await writeVoter(c, env, id)
     return c.json({ ok: true })
   })
   return app

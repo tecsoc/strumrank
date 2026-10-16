@@ -1,4 +1,4 @@
-import { and, asc, desc, inArray, isNull, or, type SQL, sql } from 'drizzle-orm'
+import { and, asc, desc, gte, inArray, isNull, lt, or, type SQL, sql } from 'drizzle-orm'
 import type { SongSummary } from '../shared/api'
 import type { Db } from './db/client'
 import { songs } from './db/schema'
@@ -17,11 +17,14 @@ function tokenize(q: string): string[] {
 }
 
 const escapeLike = (t: string) => t.replace(/[\\%_]/g, (c) => `\\${c}`)
+// 前方一致の上端。BINARY 照合では U+10FFFF を付けた文字列が、t で始まるどの文字列よりも大きい
+const prefixEnd = (t: string) => `${t}\u{10FFFF}`
 const ftsPhrase = (t: string) => `"${t.replaceAll('"', '""')}"`
 
 /**
  * 入力補完用に登録済みの曲を探す。3文字以上の語は全文索引（songs_fts）で絞り、
- * 短い語（「糸」「蕾」など）は LIKE で補う。短い語しかない場合だけ全件を走査する。
+ * 短い語（「糸」「蕾」など）は絞った結果に LIKE で部分一致をかける。
+ * 短い語しかない場合は全件を走査しないよう、曲名かアーティスト名の前方一致（索引の範囲検索）に限る。
  */
 export async function suggestSongs(db: Db, q: string): Promise<SongSummary[]> {
   const tokens = tokenize(q)
@@ -35,11 +38,16 @@ export async function suggestSongs(db: Db, q: string): Promise<SongSummary[]> {
     conditions.push(inArray(songs.id, sql`(SELECT rowid FROM songs_fts WHERE songs_fts MATCH ${match})`))
   }
   for (const t of short) {
-    const pattern = `%${escapeLike(t)}%`
-    const cond = or(
-      sql`${songs.titleNorm} LIKE ${pattern} ESCAPE '\\'`,
-      sql`${songs.artistNorm} LIKE ${pattern} ESCAPE '\\'`,
-    )
+    const cond =
+      long.length > 0
+        ? or(
+            sql`${songs.titleNorm} LIKE ${`%${escapeLike(t)}%`} ESCAPE '\\'`,
+            sql`${songs.artistNorm} LIKE ${`%${escapeLike(t)}%`} ESCAPE '\\'`,
+          )
+        : or(
+            and(gte(songs.titleNorm, t), lt(songs.titleNorm, prefixEnd(t))),
+            and(gte(songs.artistNorm, t), lt(songs.artistNorm, prefixEnd(t))),
+          )
     if (cond) conditions.push(cond)
   }
 

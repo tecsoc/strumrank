@@ -4,8 +4,39 @@ import { MAX_LEVEL, type Sort } from '../shared/levels'
 import { normalizeArtist, normalizeTitle } from '../shared/normalize'
 import type { Db } from './db/client'
 import { likes, songSources, songs, votes } from './db/schema'
+import { MAX_PER_SONG_PER_IP, MAX_PER_SONG_PER_SUBNET } from './voter'
 
 const RANKING_PAGE_SIZE = 30
+const DAY_MS = 24 * 60 * 60 * 1000
+// 曲の登録の上限（24時間あたり）。スパムの曲の量産と、正規化キーの先取りを抑える
+export const MAX_REGISTRATIONS_PER_VOTER_PER_DAY = 20
+export const MAX_REGISTRATIONS_PER_IP_PER_DAY = 50
+// 照合で1回に読む行数の上限と、1文あたりの組の数（D1 のバインド上限 100 に収める）
+const RESOLVE_LIMIT = 50
+const RESOLVE_PAIRS_PER_QUERY = 25
+
+/** 上限に当たって書き込めなかったことを表す */
+export const CAPPED = 'capped' as const
+export type Capped = typeof CAPPED
+
+/**
+ * 1曲あたりの回線上限を、書き込みと同じ1文の WHERE で判定するための条件。
+ * 自分の既存の行（票の変更・いいね済み）は常に通す。投票者の行が無い場合（テスト用の固定 ID など）は 0 件として数える。
+ * D1 は1文ずつ直列に実行するので、同時に来ても上限を超えない。
+ */
+function networkCapCondition(table: 'votes' | 'likes', songId: number, voterId: string): SQL {
+  // テーブル名はバインドできないため、許可した2つの名前だけを埋め込む
+  const t = sql.raw(table === 'votes' ? 'votes' : 'likes')
+  return sql`(
+    EXISTS (SELECT 1 FROM ${t} WHERE song_id = ${songId} AND voter_id = ${voterId})
+    OR (
+      (SELECT COUNT(*) FROM ${t} AS x JOIN voters AS v ON v.id = x.voter_id
+        WHERE x.song_id = ${songId} AND v.ip_hash = (SELECT ip_hash FROM voters WHERE id = ${voterId})) < ${MAX_PER_SONG_PER_IP}
+      AND (SELECT COUNT(*) FROM ${t} AS x JOIN voters AS v ON v.id = x.voter_id
+        WHERE x.song_id = ${songId} AND v.subnet_hash = (SELECT subnet_hash FROM voters WHERE id = ${voterId})) < ${MAX_PER_SONG_PER_SUBNET}
+    )
+  )`
+}
 
 export const summaryColumns = {
   id: songs.id,
@@ -74,7 +105,23 @@ async function findByNormKey(db: Db, artistNorm: string, titleNorm: string): Pro
   return row.mergedInto === null ? row.id : resolveId(db, row.mergedInto)
 }
 
-export async function registerSong(db: Db, input: RegisterSongInput): Promise<{ id: number; created: boolean }> {
+/**
+ * 曲を登録する。registeredBy（登録した投票者）を渡すと、新しい曲を作るときに1日の登録数の上限をかける。
+ * 既存の曲への紐づけ（created: false）は上限に数えない。上限に当たったら CAPPED を返す。
+ */
+export async function registerSong(db: Db, input: RegisterSongInput): Promise<{ id: number; created: boolean }>
+export async function registerSong(
+  db: Db,
+  input: RegisterSongInput,
+  registeredBy: string,
+  now?: number,
+): Promise<{ id: number; created: boolean } | Capped>
+export async function registerSong(
+  db: Db,
+  input: RegisterSongInput,
+  registeredBy?: string,
+  now = Date.now(),
+): Promise<{ id: number; created: boolean } | Capped> {
   const externalId = String(input.itunesTrackId)
   const source = await db
     .select({ songId: songSources.songId })
@@ -94,23 +141,28 @@ export async function registerSong(db: Db, input: RegisterSongInput): Promise<{ 
     return { id: existing, created: false }
   }
 
-  // 同時登録で一意制約に当たっても落ちないよう、挿入できなければ既存行を引く
-  const inserted = await db
-    .insert(songs)
-    .values({
-      title: input.title,
-      artist: input.artist,
-      titleNorm,
-      artistNorm,
-      artworkUrl: input.artworkUrl ?? null,
-      appleMusicUrl: input.appleMusicUrl ?? null,
-      durationMs: input.durationMs ?? null,
-    })
-    .onConflictDoNothing()
-    .returning({ id: songs.id })
+  // 上限の判定と挿入を1文にする（同時に登録されても上限を超えない）。
+  // 一意制約に当たった（同時に同じ曲が登録された）場合は挿入されないので、既存行を引き直す
+  const since = now - DAY_MS
+  const withinCap = registeredBy
+    ? sql`(SELECT COUNT(*) FROM songs WHERE registered_by = ${registeredBy} AND created_at > ${since}) < ${MAX_REGISTRATIONS_PER_VOTER_PER_DAY}
+        AND (SELECT COUNT(*) FROM voters AS v JOIN songs AS s ON s.registered_by = v.id AND s.created_at > ${since}
+          WHERE v.ip_hash = (SELECT ip_hash FROM voters WHERE id = ${registeredBy})) < ${MAX_REGISTRATIONS_PER_IP_PER_DAY}`
+    : sql`1`
+  const inserted = await db.all<{ id: number }>(sql`
+    INSERT INTO songs (title, artist, title_norm, artist_norm, artwork_url, apple_music_url, duration_ms, registered_by, created_at)
+    SELECT ${input.title}, ${input.artist}, ${titleNorm}, ${artistNorm}, ${input.artworkUrl ?? null},
+      ${input.appleMusicUrl ?? null}, ${input.durationMs ?? null}, ${registeredBy ?? null}, ${now}
+    WHERE ${withinCap}
+    ON CONFLICT DO NOTHING
+    RETURNING id`)
   const created = inserted[0]
   const id = created?.id ?? (await findByNormKey(db, artistNorm, titleNorm))
-  if (id === null) throw new Error('song upsert failed')
+  // 上限を渡していない（registeredBy なし）なら挿入は必ず成功するか既存行がある
+  if (id === null) {
+    if (registeredBy) return CAPPED
+    throw new Error('song upsert failed')
+  }
 
   await db.insert(songSources).values({ provider: 'itunes', externalId, songId: id }).onConflictDoNothing()
   return { id, created: created !== undefined }
@@ -126,8 +178,26 @@ export async function resolveSongs(
     externalId: String(i.itunesTrackId),
     key: `${normalizeArtist(i.artist)}\u0000${normalizeTitle(i.title)}`,
   }))
-  const artistNorms = [...new Set(items.map((i) => normalizeArtist(i.artist)))]
-  const [bySource, byNorm] = await db.batch([
+  // 正規化キー（アーティスト, 曲名）の完全一致の組で引く。同じアーティストの曲をまとめて読まない
+  const pairs = [
+    ...new Map(
+      items.map((i) => {
+        const p = { artistNorm: normalizeArtist(i.artist), titleNorm: normalizeTitle(i.title) }
+        return [`${p.artistNorm}\u0000${p.titleNorm}`, p] as const
+      }),
+    ).values(),
+  ]
+  const chunks: (typeof pairs)[] = []
+  for (let i = 0; i < pairs.length; i += RESOLVE_PAIRS_PER_QUERY)
+    chunks.push(pairs.slice(i, i + RESOLVE_PAIRS_PER_QUERY))
+  const byNormQueries = chunks.map((chunk) =>
+    db
+      .select({ id: songs.id, artistNorm: songs.artistNorm, titleNorm: songs.titleNorm, mergedInto: songs.mergedInto })
+      .from(songs)
+      .where(or(...chunk.map((p) => and(eq(songs.artistNorm, p.artistNorm), eq(songs.titleNorm, p.titleNorm)))))
+      .limit(RESOLVE_LIMIT),
+  )
+  const [bySource, ...byNormChunks] = await db.batch([
     db
       .select({ externalId: songSources.externalId, songId: songSources.songId, mergedInto: songs.mergedInto })
       .from(songSources)
@@ -140,12 +210,16 @@ export async function resolveSongs(
             keyed.map((k) => k.externalId),
           ),
         ),
-      ),
-    db
-      .select({ id: songs.id, artistNorm: songs.artistNorm, titleNorm: songs.titleNorm, mergedInto: songs.mergedInto })
-      .from(songs)
-      .where(inArray(songs.artistNorm, artistNorms)),
+      )
+      .limit(RESOLVE_LIMIT),
+    ...byNormQueries,
   ])
+  const byNorm = byNormChunks.flat() as {
+    id: number
+    artistNorm: string
+    titleNorm: string
+    mergedInto: number | null
+  }[]
 
   // mergeSong が統合済みの子も統合先へ付け替えるので、merged_into は1段たどれば足りる
   const sourceMap = new Map(bySource.map((r) => [r.externalId, r.mergedInto ?? r.songId]))
@@ -208,7 +282,7 @@ export async function vote(
   voterId: string,
   level: number,
   hop = 0,
-): Promise<SongResponse | null> {
+): Promise<SongResponse | Capped | null> {
   const target = await resolveId(db, songId)
   if (target === null) return null
   const now = new Date()
@@ -225,13 +299,17 @@ export async function vote(
             updatedAt: sql<number>`${now.getTime()}`.as('updated_at'),
           })
           .from(songs)
-          .where(and(eq(songs.id, target), isNull(songs.mergedInto))),
+          .where(and(eq(songs.id, target), isNull(songs.mergedInto), networkCapCondition('votes', target, voterId))),
       )
       .onConflictDoUpdate({ target: [votes.songId, votes.voterId], set: { level, updatedAt: now } })
       .returning({ songId: votes.songId }),
     recomputeAggregates(db, target),
   ])
-  if (inserted.length === 0) return hop < MAX_MERGE_HOPS ? vote(db, target, voterId, level, hop + 1) : null
+  if (inserted.length === 0) {
+    // 入らなかった理由が統合なら統合先でやり直し、そうでなければ回線の上限
+    if ((await resolveId(db, target)) === target) return CAPPED
+    return hop < MAX_MERGE_HOPS ? vote(db, target, voterId, level, hop + 1) : null
+  }
   return getSong(db, target, voterId)
 }
 
@@ -245,7 +323,7 @@ export async function setLike(
   voterId: string,
   liked: boolean,
   hop = 0,
-): Promise<SongResponse | null> {
+): Promise<SongResponse | Capped | null> {
   const target = await resolveId(db, songId)
   if (target === null) return null
   if (!liked) {
@@ -266,14 +344,17 @@ export async function setLike(
             createdAt: sql<number>`${Date.now()}`.as('created_at'),
           })
           .from(songs)
-          .where(and(eq(songs.id, target), isNull(songs.mergedInto))),
+          .where(and(eq(songs.id, target), isNull(songs.mergedInto), networkCapCondition('likes', target, voterId))),
       )
       // 既にいいね済みでも行を返させるため、DO NOTHING ではなく同値で更新する
       .onConflictDoUpdate({ target: [likes.songId, likes.voterId], set: { songId: sql`excluded.song_id` } })
       .returning({ songId: likes.songId }),
     recomputeLikes(db, target),
   ])
-  if (inserted.length === 0) return hop < MAX_MERGE_HOPS ? setLike(db, target, voterId, liked, hop + 1) : null
+  if (inserted.length === 0) {
+    if ((await resolveId(db, target)) === target) return CAPPED
+    return hop < MAX_MERGE_HOPS ? setLike(db, target, voterId, liked, hop + 1) : null
+  }
   return getSong(db, target, voterId)
 }
 

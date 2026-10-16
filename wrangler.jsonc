@@ -22,10 +22,15 @@
     { "name": "REGISTER_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
     { "name": "VOTE_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } },
     { "name": "LIKE_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } },
-    { "name": "SEARCH_LIMITER", "namespace_id": "1004", "simple": { "limit": 120, "period": 60 } }
+    { "name": "SEARCH_LIMITER", "namespace_id": "1004", "simple": { "limit": 120, "period": 60 } },
+    { "name": "READ_LIMITER", "namespace_id": "1005", "simple": { "limit": 300, "period": 60 } },
+    { "name": "SESSION_LIMITER", "namespace_id": "1006", "simple": { "limit": 20, "period": 60 } }
   ],
-  // Turnstile のサイトキー（公開値）。今は Cloudflare 公式の常時成功テストキー。
-  // 本番キーはユーザーがダッシュボードで発行し、ここを差し替える。シークレットは wrangler secret で登録する
-  "vars": { "TURNSTILE_SITE_KEY": "0x4AAAAAAFYdj0zb3ShxyvOL" },
+  // Turnstile の本番サイトキー（公開値）と、確認を受け付けるホスト名。
+  // ローカルでは .dev.vars のテストキーが優先される。シークレットは `wrangler secret put` で登録する
+  "vars": {
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAFYdj0zb3ShxyvOL",
+    "TURNSTILE_HOSTNAME": "strumrank.tecsoc.workers.dev"
+  },
   "observability": { "enabled": true }
 }

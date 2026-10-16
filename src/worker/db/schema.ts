@@ -32,6 +32,8 @@ export const songs = sqliteTable(
     mbNextTryAt: integer('mb_next_try_at', { mode: 'timestamp_ms' }),
     // 重複として統合された場合の統合先
     mergedInto: integer('merged_into'),
+    // 登録した投票者（1日の登録数の上限に使う）。この列を追加する前の曲と、テストでの直接登録は NULL
+    registeredBy: text('registered_by'),
     createdAt: createdAt(),
   },
   (t) => [
@@ -42,6 +44,9 @@ export const songs = sqliteTable(
     index('songs_ranking_new').on(t.mergedInto, t.createdAt),
     index('songs_ranking_likes').on(t.mergedInto, t.likeCount, t.voteCount),
     index('songs_mb_queue').on(t.mbStatus, t.mbNextTryAt),
+    index('songs_registered').on(t.registeredBy, t.createdAt),
+    // 1〜2文字の補完は曲名・アーティスト名の前方一致（範囲検索）で引く
+    index('songs_title_norm').on(t.titleNorm),
   ],
 )
 

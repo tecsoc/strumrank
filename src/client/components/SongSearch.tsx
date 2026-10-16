@@ -6,6 +6,7 @@ import { levelLabel } from '../../shared/levels'
 import { ApiError, api } from '../lib/api'
 import { type Candidate, searchItunes } from '../lib/itunes'
 import { useDebounced } from '../lib/useDebounced'
+import { actionErrorMessage, withVerification } from '../lib/verify'
 import { Artwork } from './Artwork'
 
 // iTunes は 1分あたり約20回まで。打鍵ごとに叩かないよう長めに待つ
@@ -68,21 +69,26 @@ export function SongSearch() {
   })
 
   const register = useMutation({
+    // 曲の登録も投票と同じく、初回は自動登録でないことを確認してから送る
     mutationFn: (c: Candidate) =>
-      api.register({
-        itunesTrackId: c.itunesTrackId,
-        title: c.title,
-        artist: c.artist,
-        artworkUrl: c.artworkUrl,
-        appleMusicUrl: c.appleMusicUrl,
-        durationMs: c.durationMs,
-      }),
+      withVerification(() =>
+        api.register({
+          itunesTrackId: c.itunesTrackId,
+          title: c.title,
+          artist: c.artist,
+          artworkUrl: c.artworkUrl,
+          appleMusicUrl: c.appleMusicUrl,
+          durationMs: c.durationMs,
+        }),
+      ),
     onSuccess: ({ id }) => {
       // 追加した曲がランキングの新着や検索候補にすぐ出るようにする
       for (const key of ['ranking', 'suggest', 'resolve']) queryClient.invalidateQueries({ queryKey: [key] })
       navigate({ to: '/songs/$songId', params: { songId: String(id) } })
     },
   })
+
+  const registerError = register.isError ? registerErrorMessage(register.error) : null
 
   const showLists = term.length > 0
   const localSongs = showLists ? (local.data ?? []) : []
@@ -176,11 +182,9 @@ export function SongSearch() {
         className="w-full rounded-[4px] border-2 border-ink bg-transparent px-4 py-3 text-lg placeholder:text-muted/70 focus-visible:border-pick focus-visible:outline-none"
       />
 
-      {register.isError && (
-        <p className="mt-2 text-sm text-danger">
-          {register.error instanceof ApiError && register.error.status === 422
-            ? 'カラオケ版やインストゥルメンタルは追加できません。歌入りの録音を選んでください。'
-            : '曲を追加できませんでした。もう一度選んでください。'}
+      {registerError && (
+        <p role="alert" className="mt-2 text-sm text-danger">
+          {registerError}
         </p>
       )}
 
@@ -305,3 +309,14 @@ const SuggestionItem = memo(function SuggestionItem({
     </>
   )
 })
+
+/** 曲の追加の失敗を画面の文言にする。確認ダイアログを閉じた場合は null（何も出さない）。 */
+function registerErrorMessage(e: unknown): string | null {
+  if (e instanceof ApiError && e.status === 422) {
+    return 'カラオケ版やインストゥルメンタルは追加できません。歌入りの録音を選んでください。'
+  }
+  if (e instanceof ApiError && e.code === 'too_many_registrations') {
+    return '今日はこれ以上曲を追加できません。明日またお試しください。'
+  }
+  return actionErrorMessage(e, '曲を追加できませんでした。もう一度選んでください。')
+}

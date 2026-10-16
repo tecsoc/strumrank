@@ -2,15 +2,15 @@ import { env } from 'cloudflare:workers'
 import { Hono } from 'hono'
 import { beforeAll, describe, expect, it } from 'vitest'
 import {
-  checkPerSongIpCap,
+  cleanupVoters,
   DATACENTER_REVERIFY_MS,
   hashIp,
   issueVoter,
-  MAX_PER_SONG_PER_IP,
-  MAX_PER_SONG_PER_SUBNET,
   MAX_VOTERS_PER_IP_PER_DAY,
   MAX_VOTERS_PER_SUBNET_PER_DAY,
   normalizeIp,
+  rateLimitKey,
+  readVoterCookie,
   registerSessionRoutes,
   requireVoter,
   signVoterId,
@@ -41,11 +41,20 @@ const netBase = Math.floor(Math.random() * 200)
 const uniqueSubnet = () => `10.${netBase}.${++ipSeq % 256}`
 const uniqueIp = () => `${uniqueSubnet()}.7`
 
-/** siteverify の結果を固定したテスト用アプリ */
-function createApp(turnstileSuccess: boolean) {
+/**
+ * siteverify の結果を固定したテスト用アプリ。turnstile は成否か、siteverify の応答そのもの。
+ * origin を http にするとローカル開発（__Host- cookie を使わない）を再現できる。
+ */
+function createApp(
+  turnstile: boolean | Record<string, unknown>,
+  opts: { bindings?: Partial<VoterBindings>; origin?: string } = {},
+) {
+  const verifyResponse = typeof turnstile === 'boolean' ? { success: turnstile } : turnstile
+  const env = { ...bindings, ...opts.bindings }
+  const origin = opts.origin ?? 'https://example.com'
   const app = new Hono<{ Bindings: VoterBindings; Variables: { voterId: string } }>().basePath('/api')
   registerSessionRoutes(app, {
-    fetch: (async () => Response.json({ success: turnstileSuccess })) as unknown as typeof fetch,
+    fetch: (async () => Response.json(verifyResponse)) as unknown as typeof fetch,
   })
   app.put('/protected', requireVoter, (c) => c.json({ voterId: c.var.voterId }))
   return (path: string, init: RequestInit & { ip?: string; cookie?: string; asn?: number } = {}) => {
@@ -53,10 +62,10 @@ function createApp(turnstileSuccess: boolean) {
     if (init.ip) headers.set('cf-connecting-ip', init.ip)
     if (init.cookie) headers.set('Cookie', init.cookie)
     if (init.body) headers.set('Content-Type', 'application/json')
-    const req = new Request(`https://example.com${path}`, { ...init, headers })
+    const req = new Request(`${origin}${path}`, { ...init, headers })
     // 本番では Cloudflare が付ける request.cf を、テストでは差し込む
     if (init.asn !== undefined) Object.defineProperty(req, 'cf', { value: { asn: init.asn } })
-    return app.fetch(req, bindings)
+    return app.fetch(req, env)
   }
 }
 
@@ -136,48 +145,6 @@ describe('確認（Turnstile）と投票者 ID の発行', () => {
   })
 })
 
-describe('1曲あたりの同じ回線からの票の上限', () => {
-  async function newSong(): Promise<number> {
-    const t = `cap-${Math.random().toString(36).slice(2)}`
-    const row = await env.DB.prepare(
-      'INSERT INTO songs (title, artist, title_norm, artist_norm) VALUES (?1, ?1, ?1, ?1) RETURNING id',
-    )
-      .bind(t)
-      .first<{ id: number }>()
-    if (!row) throw new Error('insert failed')
-    return row.id
-  }
-  const voteRow = (songId: number, voterId: string) =>
-    env.DB.prepare('INSERT INTO votes (song_id, voter_id, level) VALUES (?, ?, 2)').bind(songId, voterId).run()
-  const likeRow = (songId: number, voterId: string) =>
-    env.DB.prepare('INSERT INTO likes (song_id, voter_id) VALUES (?, ?)').bind(songId, voterId).run()
-
-  it.each([
-    ['votes', voteRow],
-    ['likes', likeRow],
-  ] as const)('%s: 上限までは入れられ、超えると拒否する。別の回線と自分の票の変更は数えない', async (table, insert) => {
-    const songId = await newSong()
-    const ip = uniqueIp()
-    const sameNetwork: string[] = []
-    for (let i = 0; i <= MAX_PER_SONG_PER_IP; i++) {
-      const id = await issueVoter(env.DB, SECRET, ip)
-      if (!id) throw new Error('issue failed')
-      sameNetwork.push(id)
-    }
-    for (const id of sameNetwork.slice(0, MAX_PER_SONG_PER_IP)) {
-      expect(await checkPerSongIpCap(env.DB, table, songId, id)).toBe(true)
-      await insert(songId, id)
-    }
-    const last = sameNetwork[MAX_PER_SONG_PER_IP] as string
-    expect(await checkPerSongIpCap(env.DB, table, songId, last)).toBe(false)
-    // 既に票を入れた人の変更は許可
-    expect(await checkPerSongIpCap(env.DB, table, songId, sameNetwork[0] as string)).toBe(true)
-    // 別の回線の人は許可
-    const other = await issueVoter(env.DB, SECRET, uniqueIp())
-    expect(await checkPerSongIpCap(env.DB, table, songId, other as string)).toBe(true)
-  })
-})
-
 describe('IP の正規化とサブネット', () => {
   it.each([
     ['203.0.113.45', '203.0.113.45', '203.0.113.0/24'],
@@ -218,24 +185,6 @@ describe('サブネット単位の上限', () => {
     }
     expect(await issueVoter(env.DB, SECRET, `${prefix}:ffff::1`)).toBeNull()
     expect(await issueVoter(env.DB, SECRET, `2001:db8:${(++ipSeq).toString(16)}::1`)).not.toBeNull()
-  })
-
-  it('1曲あたりも、同じサブネットの別 IP からの票はサブネットの上限まで', async () => {
-    const row = await env.DB.prepare(
-      "INSERT INTO songs (title, artist, title_norm, artist_norm) VALUES ('s','s',?1,?1) RETURNING id",
-    )
-      .bind(`subnet-${Math.random().toString(36).slice(2)}`)
-      .first<{ id: number }>()
-    const songId = row?.id as number
-    const net = uniqueSubnet()
-    const ids: string[] = []
-    for (let i = 0; i <= MAX_PER_SONG_PER_SUBNET; i++)
-      ids.push((await issueVoter(env.DB, SECRET, `${net}.${i + 1}`)) as string)
-    for (const id of ids.slice(0, MAX_PER_SONG_PER_SUBNET)) {
-      expect(await checkPerSongIpCap(env.DB, 'likes', songId, id)).toBe(true)
-      await env.DB.prepare('INSERT INTO likes (song_id, voter_id) VALUES (?, ?)').bind(songId, id).run()
-    }
-    expect(await checkPerSongIpCap(env.DB, 'likes', songId, ids[MAX_PER_SONG_PER_SUBNET] as string)).toBe(false)
   })
 })
 
@@ -307,5 +256,151 @@ describe('データセンター・VPN の回線からの投票', () => {
     expect((await call('/api/protected', { method: 'PUT', ip, asn: ISP_ASN, cookie })).status).toBe(200)
     // cf が無い（ローカル開発）場合も同じ
     expect((await call('/api/protected', { method: 'PUT', ip, cookie })).status).toBe(200)
+  })
+})
+
+describe('回数制限のキー', () => {
+  it('IPv6 は /64 にまとめ、IPv4 と IPv4-mapped IPv6 は同じ IPv4 にする', () => {
+    expect(rateLimitKey('2001:db8:1:2:3:4:5:6')).toBe(rateLimitKey('2001:db8:1:2:ffff::1'))
+    expect(rateLimitKey('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
+    expect(rateLimitKey('2001:db8:1:3::1')).not.toBe(rateLimitKey('2001:db8:1:2::1'))
+    expect(rateLimitKey('::ffff:192.0.2.1')).toBe('192.0.2.1')
+    expect(rateLimitKey('192.0.2.1')).toBe('192.0.2.1')
+  })
+})
+
+describe('Turnstile の hostname と action の照合', () => {
+  const HOST = 'strumrank.example'
+  const session = (verify: Record<string, unknown>, hostname?: string) =>
+    createApp(verify, { bindings: { TURNSTILE_HOSTNAME: hostname } })('/api/session', {
+      method: 'POST',
+      ip: uniqueIp(),
+      body: JSON.stringify({ token: 't' }),
+    })
+
+  it('設定した hostname と action が一致したときだけ通す', async () => {
+    expect((await session({ success: true, hostname: HOST, action: 'vote' }, HOST)).status).toBe(200)
+    expect((await session({ success: true, hostname: 'evil.example', action: 'vote' }, HOST)).status).toBe(403)
+    expect((await session({ success: true, hostname: HOST, action: 'login' }, HOST)).status).toBe(403)
+    expect((await session({ success: true, hostname: HOST }, HOST)).status).toBe(403)
+  })
+
+  it('hostname を設定していなければ照合しない（ローカルのテストキー）', async () => {
+    expect((await session({ success: true, hostname: 'example.com' })).status).toBe(200)
+    expect((await session({ success: true }, '')).status).toBe(200)
+  })
+})
+
+describe('cookie の名前と署名の版', () => {
+  const ID = '00000000-0000-4000-8000-0000000000aa'
+  const setCookies = (res: Response) => res.headers.getSetCookie()
+
+  it('https では __Host- 付き（Secure・Path=/・Domain なし）、http では従来名で発行する', async () => {
+    const ip = uniqueIp()
+    const https = await createApp(true)('/api/session', { method: 'POST', ip, body: JSON.stringify({ token: 't' }) })
+    const [hostCookie = ''] = setCookies(https)
+    expect(hostCookie).toMatch(/^__Host-sr_vid=[0-9a-f-]{36}\.v1\./)
+    expect(hostCookie).toMatch(/; Secure/)
+    expect(hostCookie).toMatch(/; Path=\//)
+    expect(hostCookie).not.toMatch(/Domain=/i)
+
+    const http = await createApp(true, { origin: 'http://localhost' })('/api/session', {
+      method: 'POST',
+      ip: uniqueIp(),
+      body: JSON.stringify({ token: 't' }),
+    })
+    const [plain = ''] = setCookies(http)
+    expect(plain).toMatch(/^sr_vid=/)
+    expect(plain).not.toMatch(/Secure/)
+  })
+
+  it('https で従来名の cookie しか無ければ受け付け、__Host- 付きへ移して従来名を消す', async () => {
+    const ip = uniqueIp()
+    const issued = await createApp(true, { origin: 'http://localhost' })('/api/session', {
+      method: 'POST',
+      ip,
+      body: JSON.stringify({ token: 't' }),
+    })
+    const legacy = cookieOf(issued) // sr_vid=...
+    const res = await createApp(true)('/api/protected', { method: 'PUT', ip, cookie: legacy })
+    expect(res.status).toBe(200)
+    const cookies = setCookies(res)
+    expect(cookies.some((c) => c.startsWith('__Host-sr_vid='))).toBe(true)
+    expect(cookies.some((c) => /^sr_vid=;.*Max-Age=0/.test(c))).toBe(true)
+  })
+
+  it('旧形式（版なし）の署名は現鍵で検証できれば受け付け、v1 形式で発行し直す', async () => {
+    const v1 = await signVoterId(SECRET, ID)
+    const old = v1.replace('.v1.', '.')
+    expect(await readVoterCookie(SECRET, old)).toEqual({ id: ID, stale: true })
+    expect(await readVoterCookie(SECRET, v1)).toEqual({ id: ID, stale: false })
+
+    const res = await createApp(true)('/api/protected', {
+      method: 'PUT',
+      ip: uniqueIp(),
+      cookie: `__Host-sr_vid=${old}`,
+    })
+    expect(res.status).toBe(200)
+    expect(setCookies(res)[0]).toMatch(new RegExp(`^__Host-sr_vid=${ID}\\.v1\\.`))
+  })
+
+  it('入れ替え前の鍵（VOTER_SECRET_PREV）の署名も受け付け、現鍵で署名し直す', async () => {
+    const OLD = 'old-voter-secret'
+    const signedByOld = await signVoterId(OLD, ID)
+    const withPrev = createApp(true, { bindings: { VOTER_SECRET_PREV: OLD } })
+    const res = await withPrev('/api/protected', {
+      method: 'PUT',
+      ip: uniqueIp(),
+      cookie: `__Host-sr_vid=${signedByOld}`,
+    })
+    expect(res.status).toBe(200)
+    const renewed = cookieOf(res).split('=')[1]
+    expect(await readVoterCookie(SECRET, renewed)).toEqual({ id: ID, stale: false })
+
+    // 旧鍵を外したら受け付けない。旧形式（版なし）は旧鍵では検証しない
+    const withoutPrev = createApp(true)
+    expect(
+      (await withoutPrev('/api/protected', { method: 'PUT', ip: uniqueIp(), cookie: `__Host-sr_vid=${signedByOld}` }))
+        .status,
+    ).toBe(401)
+    expect(await readVoterCookie(SECRET, signedByOld.replace('.v1.', '.'), OLD)).toBeNull()
+  })
+})
+
+describe('古い投票者 ID の掃除', () => {
+  it('400日を過ぎたもの、30日を過ぎて票もいいねも無いものを消し、それ以外は残す', async () => {
+    const now = Date.now()
+    const day = 24 * 60 * 60 * 1000
+    const tag = Math.random().toString(36).slice(2, 10)
+    const ids = {
+      expired: `cleanup-${tag}-expired`,
+      inactive: `cleanup-${tag}-inactive`,
+      activeOld: `cleanup-${tag}-active-old`,
+      recent: `cleanup-${tag}-recent`,
+    }
+    const insertVoter = (id: string, ageDays: number) =>
+      env.DB.prepare('INSERT INTO voters (id, ip_hash, created_at) VALUES (?1, ?2, ?3)')
+        .bind(id, `hash-${tag}`, now - ageDays * day)
+        .run()
+    await insertVoter(ids.expired, 401)
+    await insertVoter(ids.inactive, 31)
+    await insertVoter(ids.activeOld, 31)
+    await insertVoter(ids.recent, 1)
+    const song = await env.DB.prepare(
+      "INSERT INTO songs (title, artist, title_norm, artist_norm) VALUES ('掃除', ?1, '掃除', ?1) RETURNING id",
+    )
+      .bind(`cleanup-${tag}`)
+      .first<{ id: number }>()
+    await env.DB.prepare('INSERT INTO likes (song_id, voter_id) VALUES (?1, ?2)').bind(song?.id, ids.activeOld).run()
+
+    expect(await cleanupVoters(env.DB, now)).toBeGreaterThanOrEqual(2)
+    const left = await env.DB.prepare('SELECT id FROM voters WHERE id LIKE ?1')
+      .bind(`cleanup-${tag}-%`)
+      .all<{ id: string }>()
+    expect(left.results.map((r) => r.id).sort()).toEqual([ids.activeOld, ids.recent].sort())
+    // 消した投票者のいいねは残す
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS n FROM likes WHERE voter_id = ?1').bind(ids.activeOld).first('n'),
+    ).toBe(1)
   })
 })
