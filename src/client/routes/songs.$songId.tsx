@@ -102,7 +102,7 @@ function SongView({ song }: { song: SongDetail }) {
             {/* Spotify Design Guidelines: 公式アイコンを改変せず 21px 以上、周囲にアイコン高さの半分の余白。
                 緑は白黒背景のみ可なので、この背景色では単色（ライトは黒・ダークは白）を使う */}
             <a
-              href={spotifySearchUrl(song.title, song.artist)}
+              href={song.spotifyUrl ?? spotifySearchUrl(song.title, song.artist)}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex h-10 items-center gap-3 rounded-[8px] border-2 border-ink px-3 font-bold hover:bg-line/50"
@@ -111,7 +111,7 @@ function SongView({ song }: { song: SongDetail }) {
                 <source srcSet="/badges/spotify-icon-white.svg" media="(prefers-color-scheme: dark)" />
                 <img src="/badges/spotify-icon-black.svg" alt="" width={24} height={24} className="size-6" />
               </picture>
-              Spotify で探す
+              {song.spotifyUrl ? 'Spotify で聴く' : 'Spotify で探す'}
             </a>
           </div>
 

@@ -174,7 +174,7 @@ export async function getSong(db: Db, songId: number, voterId: string | null): P
   const me = voterId ?? ''
   const [song, dist, mine, liked] = await db.batch([
     db
-      .select({ ...summaryColumns, appleMusicUrl: songs.appleMusicUrl })
+      .select({ ...summaryColumns, appleMusicUrl: songs.appleMusicUrl, spotifyUrl: songs.spotifyUrl })
       .from(songs)
       .where(eq(songs.id, songId)),
     db

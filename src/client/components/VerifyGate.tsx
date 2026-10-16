@@ -74,7 +74,9 @@ export function VerifyGate({
         <h2 id={titleId} className="font-bold">
           投票の前に、ロボットでないことを確認します
         </h2>
-        <p className="mt-1 text-sm text-muted">自動投票を防ぐための確認です。この端末では最初の1回だけ表示されます。</p>
+        <p className="mt-1 text-sm text-muted">
+          自動投票を防ぐための確認です。通常は最初の1回だけですが、接続環境によってはときどき表示されます。
+        </p>
         <div ref={widgetRef} className="mt-4 min-h-[65px]" />
         {(error || loadError) && (
           <p role="alert" className="mt-2 text-sm text-danger">

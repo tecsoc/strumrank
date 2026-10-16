@@ -17,6 +17,8 @@ export type RankingResponse = {
 
 export type SongDetail = SongSummary & {
   appleMusicUrl: string | null
+  /** Spotify の曲ページ。無ければ画面は検索ページへリンクする */
+  spotifyUrl: string | null
   /** distribution[i] は難易度 i+1 の票数 */
   distribution: number[]
   myVote: number | null

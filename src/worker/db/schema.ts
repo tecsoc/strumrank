@@ -15,6 +15,8 @@ export const songs = sqliteTable(
     artistNorm: text('artist_norm').notNull(),
     artworkUrl: text('artwork_url'),
     appleMusicUrl: text('apple_music_url'),
+    // MusicBrainz の recording に紐づく Spotify の曲ページ（見つかったときだけ）
+    spotifyUrl: text('spotify_url'),
     durationMs: integer('duration_ms'),
     // 投票の集計値。ランキングで毎回 votes を集計しないよう投票時に更新する
     voteCount: integer('vote_count').notNull().default(0),

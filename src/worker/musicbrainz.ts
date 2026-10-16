@@ -19,7 +19,21 @@ const defaultDeps: Deps = {
 }
 
 type SearchResponse = { recordings?: { id: string; score?: number }[] }
-type RecordingResponse = { relations?: { work?: { id: string } }[] }
+type RecordingResponse = { relations?: { work?: { id: string }; url?: { resource?: string } }[] }
+
+const SPOTIFY_TRACK =
+  /^https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2}(?:-[a-z]{2})?\/)?track\/([A-Za-z0-9]{22})(?:[/?#].*)?$/
+
+/** url-rels から Spotify の曲ページ URL を取り出す。クエリ等は除き、ID の形式が正しいものだけ採用する */
+export function spotifyTrackUrl(relations: RecordingResponse['relations']): string | null {
+  for (const r of relations ?? []) {
+    const m = r.url?.resource ? SPOTIFY_TRACK.exec(r.url.resource) : null
+    if (m) return `https://open.spotify.com/track/${m[1]}`
+  }
+  return null
+}
+
+export type RecordingMatch = { workId: string | null; spotifyUrl: string | null }
 
 // Lucene の特殊文字をエスケープする
 function escapeQuery(s: string): string {
@@ -35,21 +49,35 @@ async function getJson<T>(deps: Deps, url: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
-/** 曲名とアーティスト名から MusicBrainz の work ID を探す。見つからなければ null。 */
-export async function findWorkId(title: string, artist: string, deps: Deps = defaultDeps): Promise<string | null> {
+/**
+ * 曲名とアーティスト名から MusicBrainz の work ID と Spotify の曲ページを探す。
+ * 問い合わせ回数を増やさないよう、work を見つけた時点で打ち切り、それまでに見た recording の Spotify URL を使う。
+ */
+export async function findRecordingMatch(
+  title: string,
+  artist: string,
+  deps: Deps = defaultDeps,
+): Promise<RecordingMatch> {
   const query = `recording:"${escapeQuery(title)}" AND artist:"${escapeQuery(artist)}"`
   const search = await getJson<SearchResponse>(
     deps,
     `${API}/recording?${new URLSearchParams({ query, fmt: 'json', limit: '5' })}`,
   )
   const candidates = (search.recordings ?? []).filter((r) => (r.score ?? 0) >= MIN_SCORE).slice(0, 2)
+  let spotifyUrl: string | null = null
   for (const rec of candidates) {
     await deps.sleep(MIN_INTERVAL_MS)
-    const detail = await getJson<RecordingResponse>(deps, `${API}/recording/${rec.id}?inc=work-rels&fmt=json`)
+    const detail = await getJson<RecordingResponse>(deps, `${API}/recording/${rec.id}?inc=work-rels+url-rels&fmt=json`)
+    spotifyUrl ??= spotifyTrackUrl(detail.relations)
     const workId = detail.relations?.find((r) => r.work)?.work?.id
-    if (workId) return workId
+    if (workId) return { workId, spotifyUrl }
   }
-  return null
+  return { workId: null, spotifyUrl }
+}
+
+/** 曲名とアーティスト名から MusicBrainz の work ID を探す。見つからなければ null。 */
+export async function findWorkId(title: string, artist: string, deps: Deps = defaultDeps): Promise<string | null> {
+  return (await findRecordingMatch(title, artist, deps)).workId
 }
 
 /**
@@ -96,6 +124,11 @@ export async function mergeSong(db: Db, srcId: number, targetId: number): Promis
       .update(songs)
       .set({ mergedInto: target, voteCount: 0, avgLevel: null, likeCount: 0 })
       .where(and(eq(songs.id, srcId), isNull(songs.mergedInto))),
+    // 統合先に Spotify の曲ページが無ければ統合元のものを引き継ぐ
+    db
+      .update(songs)
+      .set({ spotifyUrl: sql`(SELECT ${songs.spotifyUrl} FROM ${songs} WHERE ${songs.id} = ${srcId})` })
+      .where(and(eq(songs.id, target), isNull(songs.spotifyUrl))),
     recomputeAggregates(db, target),
     recomputeLikes(db, target),
   ])
@@ -121,22 +154,27 @@ export async function enrichSong(db: Db, songId: number, deps: Deps = defaultDep
   const song = await db.select().from(songs).where(eq(songs.id, songId)).get()
   if (!song || song.mergedInto !== null || song.mbStatus === 'done' || song.mbStatus === 'not_found') return
 
-  let workId: string | null
+  let match: RecordingMatch
   try {
-    workId = await findWorkId(song.title, song.artist, deps)
+    match = await findRecordingMatch(song.title, song.artist, deps)
   } catch {
     await scheduleRetry(db, songId, song.mbAttempts, deps)
     return
   }
+  const spotifyUrl = song.spotifyUrl ?? match.spotifyUrl
+  const workId = match.workId
   if (!workId) {
-    await db.update(songs).set({ mbStatus: 'not_found' }).where(eq(songs.id, songId))
+    await db.update(songs).set({ mbStatus: 'not_found', spotifyUrl }).where(eq(songs.id, songId))
     return
   }
 
   // 統合まで終えて初めて done にする。途中で失敗したら error に戻して再試行させる
   // （done のまま残ると Cron の対象外になり、重複が恒久化する）
   try {
-    await db.update(songs).set({ mbWorkId: workId, mbStatus: 'done', mbNextTryAt: null }).where(eq(songs.id, songId))
+    await db
+      .update(songs)
+      .set({ mbWorkId: workId, mbStatus: 'done', mbNextTryAt: null, spotifyUrl })
+      .where(eq(songs.id, songId))
     const other = await db
       .select({ id: songs.id })
       .from(songs)
