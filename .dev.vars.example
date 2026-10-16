@@ -1,0 +1,7 @@
+# ローカル開発用。`cp .dev.vars.example .dev.vars` して使う（.dev.vars は git に入れない）
+# Turnstile は Cloudflare 公式の「常に成功する」テストキー
+# https://developers.cloudflare.com/turnstile/troubleshooting/testing/
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET=1x0000000000000000000000000000000AA
+# 投票者 ID と IP の HMAC 用。本番は `wrangler secret put VOTER_SECRET` で長いランダム値を入れる
+VOTER_SECRET=local-dev-voter-secret-change-me

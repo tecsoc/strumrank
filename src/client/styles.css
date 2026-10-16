@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Dela Gothic One", "Hiragino Sans", sans-serif;
+  --font-sans: "Zen Kaku Gothic New", "Hiragino Sans", "Noto Sans JP", sans-serif;
+
+  --color-paper: #f3f5f8;
+  --color-ink: #1e2433;
+  --color-muted: #5d6577;
+  --color-line: #d9dde4;
+  /* 指板は明るめのローズウッド。フレットと弦は背景から十分に浮くよう明るく */
+  --color-board: #7a5240;
+  --color-board-edge: #5e3d2f;
+  --color-fret: #e4e7ec;
+  --color-string: #efe3d1;
+  --color-nut: #f6f2ea;
+  --color-pick: #e3a21a;
+  --color-pick-ink: #1e2433;
+  --color-danger: #b4232f;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --color-paper: #151923;
+      --color-ink: #e8ebf1;
+      --color-muted: #9aa2b3;
+      --color-line: #2c3242;
+      --color-board: #6b4636;
+      --color-board-edge: #4d3127;
+      --color-danger: #ff8a8a;
+    }
+  }
+
+  html {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    min-height: 100dvh;
+    line-height: 1.7;
+  }
+
+  :focus-visible {
+    outline: 3px solid var(--color-pick);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      /* biome-ignore lint/complexity/noImportantStyles: 動きを減らす設定は個別指定より優先する */
+      transition-duration: 0.01ms !important;
+      /* biome-ignore lint/complexity/noImportantStyles: 同上 */
+      animation-duration: 0.01ms !important;
+    }
+  }
+}
