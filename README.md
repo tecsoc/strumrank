@@ -16,8 +16,11 @@ https://strumrank.tecsoc.workers.dev
 
 ## 開発
 
+Node.js と pnpm は `package.json` の `engines` に合うバージョンを使います。標準バージョンは `volta.node` と `packageManager` に指定しています。Node.js は開発・テスト・ビルド・デプロイに使い、本番の API は Cloudflare Workers で動きます。
+
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
+pnpm audit
 cp .dev.vars.example .dev.vars   # Turnstile のテストキーとローカル用の秘密値
 pnpm db:migrate:local
 pnpm dev
@@ -32,7 +35,11 @@ pnpm dev
 
 ## デプロイ
 
+開発と同じバージョン設定を使い、依存関係の脆弱性を確認してからデプロイします。
+
 ```sh
+pnpm install --frozen-lockfile
+pnpm audit
 pnpm db:migrate:remote
 pnpm deploy
 ```
