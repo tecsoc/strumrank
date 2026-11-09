@@ -5,3 +5,6 @@ dist
 !.dev.vars.example
 *.tsbuildinfo
 .DS_Store
+
+# Claude Code の個人設定（認証情報を含むコマンドが保存される場合がある）
+**/.claude/settings.local.json
